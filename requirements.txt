@@ -1,12 +1,27 @@
-streamlit
-langchain>=0.3.0
-langchain-community>=0.3.0
-langchain-core>=0.3.0
-langchain-groq
-langchain-huggingface
-langchain-text-splitters
-faiss-cpu
-pypdf
-sentence-transformers
-tiktoken
-numpy<2.0
+# ── Core ──────────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── PDF parsing ───────────────────────────────────────────────────────────────
+pypdf>=4.2.0
+
+# ── LangChain ecosystem ───────────────────────────────────────────────────────
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-text-splitters>=0.2.0
+langchain-huggingface>=0.0.3
+langchain-google-genai>=1.0.6
+
+# ── Embeddings (local, HuggingFace) ───────────────────────────────────────────
+sentence-transformers>=3.0.0
+torch>=2.3.0                  # CPU build; change to torch-cu121 for GPU
+
+# ── Vector store ──────────────────────────────────────────────────────────────
+faiss-cpu>=1.8.0              # Use faiss-gpu if you have a CUDA GPU
+
+# ── Google Generative AI SDK (transitive, pinned for stability) ───────────────
+google-generativeai>=0.7.0
+google-ai-generativelanguage>=0.6.6
+
+# ── Misc utilities ────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0          # Optional: load .env locally during development

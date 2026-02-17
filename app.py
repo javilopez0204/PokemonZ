@@ -1,224 +1,299 @@
 import streamlit as st
 import os
+import time
 from pypdf import PdfReader
-from typing import List
+from typing import List, Optional
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
 from langchain_core.vectorstores import VectorStore
 
-# --- Constantes y Configuración ---
-MODEL_NAME = "llama-3.3-70b-versatile" # Modelo con ventana de contexto enorme (128k tokens)
+# ---------------------------------------------------------------------------
+# Constantes
+# ---------------------------------------------------------------------------
+MODEL_NAME      = "gemini-2.0-flash-lite-preview-02-05"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-PAGE_ICON = "⚡"
-PAGE_TITLE = "Pokédex Z - Profesor Z"
-LOCAL_PDF_PATH = "GuiaPokemonZ.pdf"  # <--- ¡IMPORTANTE! Nombre exacto de tu archivo
+PAGE_ICON       = "⚡"
+PAGE_TITLE      = "Pokédex Z – Profesor Z (Gemini Edition)"
+LOCAL_PDF_PATH  = "GuiaPokemonZ.pdf"
 
+SYSTEM_TEMPLATE = """Eres el "Profesor Z", la máxima autoridad en Pokémon Z.
+Tienes acceso completo a la guía oficial del juego.
+
+INSTRUCCIONES:
+1. Usa ÚNICAMENTE el "Contexto" para responder; si no hay información suficiente dilo claramente.
+2. Responde siempre en **Español**.
+3. Usa formato claro: listas con viñetas, negritas para nombres propios y datos clave.
+4. Si la pregunta es ambigua, pide aclaraciones.
+5. Nunca inventes datos; si no lo sabes, dilo con honestidad.
+
+---
+Contexto recuperado de la guía:
+{context}
+
+Historial del chat:
+{chat_history}
+
+Pregunta del entrenador: {question}
+
+Respuesta del Profesor Z:"""
+
+# ---------------------------------------------------------------------------
+# Configuración de página (debe ir primero)
+# ---------------------------------------------------------------------------
 st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 
-# --- Capa de Lógica (Backend) ---
+# ---------------------------------------------------------------------------
+# Backend – procesamiento de PDF
+# ---------------------------------------------------------------------------
 
-def get_text_from_local_pdf(path: str) -> str:
-    """Lee el PDF del disco duro."""
+def extract_text_from_pdf(path: str) -> str:
+    """Extrae texto de todas las páginas del PDF."""
     try:
-        pdf_reader = PdfReader(path)
-        text = ""
-        for page in pdf_reader.pages:
-            content = page.extract_text()
-            if content:
-                text += content + "\n" # Añadimos salto de línea por página
-        return text
-    except Exception as e:
-        st.error(f"Error leyendo el PDF local: {e}")
+        reader = PdfReader(path)
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n".join(pages)
+    except Exception as exc:
+        st.error(f"❌ Error leyendo el PDF: {exc}")
         return ""
 
-def get_text_chunks(text: str) -> List[str]:
-    """
-    Divide el texto con una estrategia agresiva de solapamiento 
-    para no perder contexto entre cortes.
-    """
+
+def split_text(text: str) -> List[str]:
+    """Divide el texto en chunks optimizados para RAG."""
     if not text.strip():
         return []
-    
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,       # Tamaño mediano para precisión
-        chunk_overlap=300,    # Mucho solapamiento para mantener frases unidas
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=900,
+        chunk_overlap=200,
         length_function=len,
-        separators=["\n\n", "\n", " ", ""] # Prioriza cortar por párrafos
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    return text_splitter.split_text(text)
+    return splitter.split_text(text)
 
-@st.cache_resource
-def get_embeddings_model():
+
+@st.cache_resource(show_spinner=False)
+def load_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
-@st.cache_resource(show_spinner="Despertando al Profesor Z y leyendo la guía...") 
-def process_local_knowledge_base(file_path: str):
-    """Procesa el PDF solo una vez y lo guarda en memoria RAM."""
+
+@st.cache_resource(show_spinner="📖 El Profesor Z está memorizando la guía...")
+def build_vectorstore(file_path: str) -> Optional[FAISS]:
+    """Crea el índice FAISS a partir del PDF (cacheado en disco de sesión)."""
     if not os.path.exists(file_path):
         return None
-    
-    raw_text = get_text_from_local_pdf(file_path)
-    if not raw_text:
+    text = extract_text_from_pdf(file_path)
+    if not text:
         return None
+    chunks = split_text(text)
+    embeddings = load_embeddings()
+    return FAISS.from_texts(texts=chunks, embedding=embeddings)
 
-    chunks = get_text_chunks(raw_text)
-    embeddings = get_embeddings_model()
-    
-    # Creamos la base de datos vectorial
-    vectorstore = FAISS.from_texts(texts=chunks, embedding=embeddings)
-    return vectorstore
 
-def get_conversation_chain(vectorstore: VectorStore, groq_api_key: str):
-    """Configura el cerebro del bot con super-memoria."""
-    llm = ChatGroq(
-        groq_api_key=groq_api_key,
-        model_name=MODEL_NAME,
-        temperature=0.1 # Temperatura baja = Más fiel a los hechos, menos creativo
+def build_chain(vectorstore: VectorStore, api_key: str) -> ConversationalRetrievalChain:
+    """Construye la cadena RAG con Gemini."""
+    llm = ChatGoogleGenerativeAI(
+        model=MODEL_NAME,
+        google_api_key=api_key,
+        temperature=0.05,
+        convert_system_message_to_human=True,
     )
-
-    template = """
-    Eres el "Profesor Z", la autoridad máxima en Pokémon Z.
-    Tienes acceso total a la guía del juego.
-    
-    INSTRUCCIONES CLAVE:
-    1. Usa la información del "Contexto" abajo para responder.
-    2. Busca exhaustivamente. Si la respuesta está en el texto, ENCUÉNTRALA.
-    3. Si la información es parcial, intenta deducir la respuesta basándote en el contexto.
-    4. Responde siempre en Español y con formato claro (listas, negritas).
-    
-    Contexto recuperado de la guía:
-    {context}
-
-    Historial del chat:
-    {chat_history}
-
-    Pregunta del entrenador: {question}
-    
-    Respuesta del Profesor Z:"""
 
     prompt = PromptTemplate(
         input_variables=["context", "chat_history", "question"],
-        template=template
+        template=SYSTEM_TEMPLATE,
     )
 
     memory = ConversationBufferMemory(
-        memory_key='chat_history', 
-        return_messages=True, 
-        output_key='answer'
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer",
+    )
+
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 15, "fetch_k": 40, "lambda_mult": 0.6},
     )
 
     return ConversationalRetrievalChain.from_llm(
         llm=llm,
-        # --- AQUÍ ESTÁ LA MAGIA ---
-        # search_type="mmr": Busca diversidad en los resultados (no solo palabras repetidas)
-        # k=20: Recupera 20 fragmentos de texto (mucha información)
-        retriever=vectorstore.as_retriever(
-            search_type="mmr", 
-            search_kwargs={"k": 20, "fetch_k": 50, "lambda_mult": 0.5}
-        ),
+        retriever=retriever,
         memory=memory,
-        combine_docs_chain_kwargs={"prompt": prompt}
+        return_source_documents=True,
+        combine_docs_chain_kwargs={"prompt": prompt},
     )
 
-# --- Frontend (Interfaz) ---
 
-def initialize_session():
-    if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content": "¡Hola! Soy el Profesor Z. He memorizado la guía completa. Pregúntame sobre ubicaciones, evoluciones o estadísticas."}]
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
-    if "api_key" not in st.session_state:
-        st.session_state.api_key = ""
+# ---------------------------------------------------------------------------
+# Frontend – estado de sesión
+# ---------------------------------------------------------------------------
 
-def sidebar_logic():
+def init_session():
+    defaults = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "¡Hola, entrenador! Soy el **Profesor Z** ⚡\n\n"
+                    "He memorizado la guía completa de Pokémon Z. "
+                    "¡Pregúntame lo que quieras!"
+                ),
+            }
+        ],
+        "conversation": None,
+        "api_key": "",
+        "total_queries": 0,
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+# ---------------------------------------------------------------------------
+# Frontend – sidebar
+# ---------------------------------------------------------------------------
+
+def render_sidebar():
     with st.sidebar:
-        st.header("⚙️ Estado del Sistema")
-        
-        # Gestión de API Key
-        env_key = None
-        try:
-            env_key = st.secrets.get("GROQ_API_KEY")
-        except:
-            pass
+        st.image(
+            "https://upload.wikimedia.org/wikipedia/commons/9/98/International_Pok%C3%A9mon_logo.svg",
+            use_container_width=True,
+        )
+        st.header("⚙️ Configuración")
 
-        if env_key:
-            st.session_state.api_key = env_key
-            st.success("✅ Clave de Groq activa")
+        # API Key (secrets > env var > input manual)
+        api_key = (
+            st.secrets.get("GOOGLE_API_KEY", None)
+            or os.environ.get("GOOGLE_API_KEY", None)
+        )
+        if api_key:
+            st.session_state.api_key = api_key
+            st.success("✅ Google API Key configurada")
         else:
-            user_key = st.text_input("Groq API Key:", type="password")
-            if user_key:
-                st.session_state.api_key = user_key
+            typed_key = st.text_input(
+                "Google API Key",
+                type="password",
+                placeholder="AIza...",
+                help="Obtén tu clave en https://aistudio.google.com/",
+            )
+            if typed_key:
+                st.session_state.api_key = typed_key
+                st.success("✅ Clave introducida")
 
         st.divider()
 
-        # Estado del archivo
+        # Estado del PDF
         if os.path.exists(LOCAL_PDF_PATH):
-            st.info(f"📚 Guía cargada: {LOCAL_PDF_PATH}")
-            
-            # Herramienta de depuración para ver si lee bien
-            with st.expander("🔍 Ver texto extraído (Debug)"):
-                try:
-                    debug_text = get_text_from_local_pdf(LOCAL_PDF_PATH)
-                    st.text_area("Primeros 2000 caracteres:", debug_text[:2000], height=200)
-                except:
-                    st.error("No se pudo leer para debug.")
+            size_mb = os.path.getsize(LOCAL_PDF_PATH) / 1_048_576
+            st.info(f"📚 **{LOCAL_PDF_PATH}**\n\n{size_mb:.1f} MB cargado")
         else:
-            st.error(f"❌ FALTA EL ARCHIVO: {LOCAL_PDF_PATH}")
-            st.warning("Por favor, sube el archivo PDF a la carpeta de tu proyecto.")
+            st.error(f"❌ Falta el archivo `{LOCAL_PDF_PATH}`")
+            st.caption("Sube el PDF a la carpeta raíz del proyecto.")
 
-        if st.button("Reiniciar Memoria"):
-             st.session_state.messages = []
-             if st.session_state.conversation:
-                 st.session_state.conversation.memory.clear()
-             st.rerun()
+        st.divider()
 
-def chat_logic():
+        # Estadísticas
+        col1, col2 = st.columns(2)
+        col1.metric("💬 Mensajes", len(st.session_state.messages))
+        col2.metric("🔍 Consultas", st.session_state.total_queries)
+
+        # Botón reset
+        if st.button("🗑️ Reiniciar conversación", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.total_queries = 0
+            if st.session_state.conversation:
+                st.session_state.conversation.memory.clear()
+            st.rerun()
+
+        st.divider()
+        st.caption(f"Modelo: `{MODEL_NAME}`\nEmbeddings: `{EMBEDDING_MODEL}`")
+
+
+# ---------------------------------------------------------------------------
+# Frontend – chat principal
+# ---------------------------------------------------------------------------
+
+def render_chat():
     st.title(f"{PAGE_ICON} Asistente Pokémon Z")
+    st.caption("Powered by Google Gemini + FAISS RAG")
 
-    # Inicialización automática del cerebro
+    # Inicializar cadena RAG si aún no existe
     if st.session_state.api_key and st.session_state.conversation is None:
         if os.path.exists(LOCAL_PDF_PATH):
-            vectorstore = process_local_knowledge_base(LOCAL_PDF_PATH)
-            if vectorstore:
-                st.session_state.conversation = get_conversation_chain(vectorstore, st.session_state.api_key)
-            else:
-                st.error("Error crítico procesando la guía.")
+            with st.spinner("⚙️ Inicializando sistema RAG..."):
+                vectorstore = build_vectorstore(LOCAL_PDF_PATH)
+                if vectorstore:
+                    st.session_state.conversation = build_chain(
+                        vectorstore, st.session_state.api_key
+                    )
+                else:
+                    st.error("No se pudo procesar la guía. Revisa el archivo PDF.")
         else:
-            st.warning("⚠️ Esperando archivo de guía...")
+            st.warning("⚠️ El archivo `GuiaPokemonZ.pdf` no se encontró.")
 
-    # Chat UI
+    # Renderizar historial
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg.get("sources"):
+                with st.expander("📄 Fragmentos de la guía utilizados"):
+                    for i, src in enumerate(msg["sources"], 1):
+                        st.markdown(f"**Fragmento {i}:**\n> {src[:300]}…")
 
-    if prompt := st.chat_input("Ej: ¿Cómo evoluciona Eevee a Sylveon?"):
+    # Input del usuario
+    if user_input := st.chat_input("Ej: ¿Cómo evoluciona Eevee a Sylveon?"):
         if not st.session_state.conversation:
-            st.warning("⏳ Introduce tu API Key y asegúrate de que el PDF está en la carpeta.")
+            st.warning("⏳ Introduce tu Google API Key y asegúrate de que el PDF está en su sitio.")
             return
 
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        # Mostrar mensaje del usuario
+        st.session_state.messages.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
-            st.markdown(prompt)
+            st.markdown(user_input)
 
+        # Generar respuesta
         with st.chat_message("assistant"):
-            with st.spinner("Consultando la guía..."):
-                try:
-                    response = st.session_state.conversation.invoke({'question': prompt})
-                    answer = response['answer']
-                    st.markdown(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                except Exception as e:
-                    st.error(f"Error: {e}")
+            placeholder = st.empty()
+            placeholder.markdown("⚡ _El Profesor Z está consultando la guía…_")
+            t0 = time.perf_counter()
+            try:
+                result = st.session_state.conversation.invoke({"question": user_input})
+                answer = result["answer"]
+                sources = [
+                    doc.page_content
+                    for doc in result.get("source_documents", [])
+                ]
+                elapsed = time.perf_counter() - t0
+
+                placeholder.markdown(answer)
+                st.caption(f"⏱️ Respuesta generada en {elapsed:.1f}s")
+
+                if sources:
+                    with st.expander("📄 Fragmentos de la guía utilizados"):
+                        for i, src in enumerate(sources, 1):
+                            st.markdown(f"**Fragmento {i}:**\n> {src[:300]}…")
+
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": answer, "sources": sources}
+                )
+                st.session_state.total_queries += 1
+
+            except Exception as exc:
+                placeholder.error(f"❌ Error al contactar con Gemini: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Punto de entrada
+# ---------------------------------------------------------------------------
 
 def main():
-    initialize_session()
-    sidebar_logic()
-    chat_logic()
+    init_session()
+    render_sidebar()
+    render_chat()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
