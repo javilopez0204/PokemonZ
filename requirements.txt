@@ -25,3 +25,6 @@ google-ai-generativelanguage>=0.6.6
 
 # ── Misc utilities ────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0          # Optional: load .env locally during development
+
+# ── Hybrid retrieval ──────────────────────────────────────────────────────────
+rank_bm25>=0.2.2              # Requerido por BM25Retriever de langchain-community
