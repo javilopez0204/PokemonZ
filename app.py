@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import time
+import re
 from pypdf import PdfReader
 from typing import List, Optional
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -9,6 +10,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
+from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain_core.prompts import PromptTemplate
@@ -23,7 +25,6 @@ PAGE_ICON       = "⚡"
 PAGE_TITLE      = "Pokédex Z – Profesor Z (Gemini Edition)"
 LOCAL_PDF_PATH  = "GuiaPokemonZ.pdf"
 
-# Prompt principal: el LLM responde usando el contexto
 QA_TEMPLATE = """Eres el "Profesor Z", la máxima autoridad en Pokémon Z.
 Tienes acceso completo a la guía oficial del juego.
 
@@ -45,8 +46,6 @@ Pregunta: {question}
 
 Respuesta del Profesor Z:"""
 
-# Prompt de condensación: convierte preguntas de seguimiento en búsquedas autónomas
-# Usamos una versión conservadora que preserva los términos originales
 CONDENSE_TEMPLATE = """Dado el historial de conversación y la nueva pregunta del usuario,
 reformula la pregunta para que sea autónoma y mantenga TODOS los nombres propios,
 términos de Pokémon, objetos y lugares exactamente como aparecen.
@@ -68,6 +67,30 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 # Backend – procesamiento de PDF
 # ---------------------------------------------------------------------------
 
+def normalize_text(text: str) -> str:
+    """
+    Normaliza el texto para mejorar la búsqueda:
+    - Convierte encabezados en MAYÚSCULAS a Title Case para que BM25/embeddings
+      los relacionen con preguntas en minúsculas.
+    - Elimina signos de interrogación/exclamación al inicio de línea (¿¡).
+    - Colapsa espacios múltiples.
+    """
+    lines = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        # Líneas completamente en mayúsculas (títulos/encabezados) → Title Case
+        if stripped and stripped == stripped.upper() and len(stripped) > 4:
+            stripped = stripped.title()
+        # Quitar ¿ y ¡ de inicio para no confundir al tokenizador
+        stripped = re.sub(r"^[¿¡]+", "", stripped)
+        lines.append(stripped)
+    text = "\n".join(lines)
+    # Colapsar espacios y líneas vacías múltiples
+    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
 def extract_text_from_pdf(path: str) -> str:
     try:
         reader = PdfReader(path)
@@ -75,7 +98,8 @@ def extract_text_from_pdf(path: str) -> str:
         for i, page in enumerate(reader.pages):
             content = page.extract_text() or ""
             if content.strip():
-                pages.append(f"[Página {i+1}]\n{content}")
+                normalized = normalize_text(content)
+                pages.append(f"[Página {i+1}]\n{normalized}")
         return "\n\n".join(pages)
     except Exception as exc:
         st.error(f"❌ Error leyendo el PDF: {exc}")
@@ -86,7 +110,7 @@ def split_text(text: str) -> List[str]:
     if not text.strip():
         return []
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,      # Chunks pequeños = recuperación más quirúrgica
+        chunk_size=500,
         chunk_overlap=100,
         length_function=len,
         separators=["\n\n", "\n", ". ", " ", ""],
@@ -116,7 +140,7 @@ def build_chain(vectorstore: VectorStore, chunks: List[str], api_key: str) -> Co
     llm = ChatGoogleGenerativeAI(
         model=MODEL_NAME,
         google_api_key=api_key,
-        temperature=0.0,   # Máxima fidelidad al contexto
+        temperature=0.0,
         convert_system_message_to_human=True,
     )
 
@@ -136,20 +160,27 @@ def build_chain(vectorstore: VectorStore, chunks: List[str], api_key: str) -> Co
         output_key="answer",
     )
 
-    # Semántico: alta k, sin MMR para no descartar chunks relevantes
-    semantic_retriever = vectorstore.as_retriever(
+    # ── Retriever semántico con MultiQuery ────────────────────────────────────
+    # MultiQueryRetriever genera 3 variantes de la pregunta y busca con cada una.
+    # Así "caramelos raros" también busca "cómo conseguir caramelos raros",
+    # "caramelos raros infinitos", etc., cubriendo los títulos del PDF.
+    base_semantic = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 25},
+        search_kwargs={"k": 15},
+    )
+    multi_query_retriever = MultiQueryRetriever.from_llm(
+        retriever=base_semantic,
+        llm=llm,
     )
 
-    # BM25: captura coincidencias exactas de nombres propios y términos del juego
+    # ── Retriever BM25 (palabras clave exactas) ───────────────────────────────
     bm25_retriever = BM25Retriever.from_texts(chunks)
-    bm25_retriever.k = 25
+    bm25_retriever.k = 15
 
-    # Híbrido 50/50
+    # ── Híbrido: MultiQuery semántico + BM25 ─────────────────────────────────
     hybrid_retriever = EnsembleRetriever(
-        retrievers=[semantic_retriever, bm25_retriever],
-        weights=[0.5, 0.5],
+        retrievers=[multi_query_retriever, bm25_retriever],
+        weights=[0.6, 0.4],
     )
 
     return ConversationalRetrievalChain.from_llm(
@@ -158,13 +189,13 @@ def build_chain(vectorstore: VectorStore, chunks: List[str], api_key: str) -> Co
         memory=memory,
         return_source_documents=True,
         combine_docs_chain_kwargs={"prompt": qa_prompt},
-        condense_question_prompt=condense_prompt,   # Reformulación conservadora
+        condense_question_prompt=condense_prompt,
         verbose=False,
     )
 
 
 def direct_search(query: str, vectorstore: VectorStore, chunks: List[str], k: int = 10) -> List[str]:
-    """Búsqueda directa sin LLM – para diagnosticar qué recupera el retriever."""
+    """Búsqueda directa sin LLM para diagnóstico."""
     sem_docs = vectorstore.similarity_search(query, k=k)
     sem_results = [d.page_content for d in sem_docs]
 
@@ -173,9 +204,7 @@ def direct_search(query: str, vectorstore: VectorStore, chunks: List[str], k: in
     bm25_docs = bm25.get_relevant_documents(query)
     bm25_results = [d.page_content for d in bm25_docs]
 
-    # Unión sin duplicados, preservando orden
-    seen = set()
-    combined = []
+    seen, combined = set(), []
     for r in sem_results + bm25_results:
         if r not in seen:
             seen.add(r)
@@ -245,7 +274,6 @@ def render_sidebar():
 
         st.divider()
 
-        # Diagnóstico del PDF
         if os.path.exists(LOCAL_PDF_PATH):
             size_mb = os.path.getsize(LOCAL_PDF_PATH) / 1_048_576
             st.info(f"📚 **{LOCAL_PDF_PATH}** · {size_mb:.1f} MB")
@@ -260,20 +288,18 @@ def render_sidebar():
 
         st.divider()
 
-        # Modo debug
         st.session_state.debug_mode = st.toggle(
             "🔍 Modo Debug",
             value=st.session_state.debug_mode,
-            help="Muestra los fragmentos exactos que el retriever envió al modelo.",
+            help="Muestra los fragmentos exactos enviados al modelo.",
         )
 
-        # ── Herramienta de búsqueda directa ──────────────────────────────────
-        # Permite probar el retriever SIN el LLM para aislar el problema
+        # Búsqueda directa para diagnóstico
         if st.session_state.vectorstore is not None:
             st.divider()
             st.markdown("#### 🧪 Búsqueda directa en la guía")
-            st.caption("Prueba el retriever sin el modelo. Si aparece la info aquí pero el chat no la usa, el problema es el prompt de condensación.")
-            search_query = st.text_input("Buscar en la guía:", placeholder="Sylveon evolución")
+            st.caption("Si aparece la info aquí pero el chat no la usa → problema de prompt. Si no aparece → problema de retriever.")
+            search_query = st.text_input("Buscar:", placeholder="caramelos raros")
             if search_query:
                 results = direct_search(
                     search_query,
@@ -305,7 +331,7 @@ def render_sidebar():
         st.caption(
             f"Modelo: `{MODEL_NAME}`  \n"
             f"Embeddings: `{EMBEDDING_MODEL}`  \n"
-            f"Retriever: Híbrido FAISS + BM25"
+            f"Retriever: MultiQuery + BM25"
         )
 
 
@@ -315,9 +341,8 @@ def render_sidebar():
 
 def render_chat():
     st.title(f"{PAGE_ICON} Asistente Pokémon Z")
-    st.caption("Powered by Google Gemini · Retriever híbrido semántico + BM25")
+    st.caption("Powered by Google Gemini · MultiQuery + BM25 + normalización de texto")
 
-    # Inicializar RAG
     if st.session_state.api_key and st.session_state.conversation is None:
         if os.path.exists(LOCAL_PDF_PATH):
             with st.spinner("⚙️ Inicializando sistema RAG..."):
@@ -337,7 +362,6 @@ def render_chat():
         else:
             st.warning("⚠️ El archivo `GuiaPokemonZ.pdf` no se encontró.")
 
-    # Historial
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -347,8 +371,7 @@ def render_chat():
                         st.markdown(f"**Fragmento {i}:**")
                         st.code(src, language=None)
 
-    # Input
-    if user_input := st.chat_input("Ej: ¿Cómo evoluciona Eevee a Sylveon?"):
+    if user_input := st.chat_input("Ej: ¿Dónde consigo caramelos raros?"):
         if not st.session_state.conversation:
             st.warning("⏳ Introduce tu Google API Key y asegúrate de que el PDF está en su sitio.")
             return
