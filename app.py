@@ -19,7 +19,7 @@ from langchain_core.vectorstores import VectorStore
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
-MODEL_NAME      = "gemini-2.5-flash-lite-preview-06-17"
+MODEL_NAME      = "gemini-2.5-flash-lite"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 PAGE_ICON       = "⚡"
 PAGE_TITLE      = "Pokédex Z – Profesor Z (Gemini Edition)"
