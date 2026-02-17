@@ -17,33 +17,47 @@ from langchain_core.vectorstores import VectorStore
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
-MODEL_NAME      = "gemini-2.5-flash-lite"
+MODEL_NAME      = "gemini-2.5-flash-lite-preview-06-17"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 PAGE_ICON       = "⚡"
 PAGE_TITLE      = "Pokédex Z – Profesor Z (Gemini Edition)"
 LOCAL_PDF_PATH  = "GuiaPokemonZ.pdf"
 
-SYSTEM_TEMPLATE = """Eres el "Profesor Z", la máxima autoridad en Pokémon Z.
+# Prompt principal: el LLM responde usando el contexto
+QA_TEMPLATE = """Eres el "Profesor Z", la máxima autoridad en Pokémon Z.
 Tienes acceso completo a la guía oficial del juego.
 
-INSTRUCCIONES:
-1. Usa ÚNICAMENTE el "Contexto" para responder; si no hay información suficiente dilo claramente.
-2. Responde siempre en **Español**.
-3. Usa formato claro: listas con viñetas, negritas para nombres propios y datos clave.
-4. Si la pregunta es ambigua, pide aclaraciones.
-5. Nunca inventes datos; si no lo sabes, dilo con honestidad.
-6. Revisa TODO el contexto proporcionado antes de decir que no tienes la información.
+INSTRUCCIONES CRÍTICAS:
+1. La respuesta SIEMPRE está en el "Contexto" de abajo. Léelo entero con atención.
+2. Busca keywords, sinónimos y variantes ortográficas antes de rendirte.
+3. Si encuentras la información aunque sea parcial, dala.
+4. Solo di "no encuentro esa información" si el contexto está completamente vacío o irrelevante.
+5. Responde siempre en **Español**, con listas y negritas.
 
 ---
-Contexto recuperado de la guía:
+Contexto de la guía (léelo completo):
 {context}
 
-Historial del chat:
+Historial:
 {chat_history}
 
-Pregunta del entrenador: {question}
+Pregunta: {question}
 
 Respuesta del Profesor Z:"""
+
+# Prompt de condensación: convierte preguntas de seguimiento en búsquedas autónomas
+# Usamos una versión conservadora que preserva los términos originales
+CONDENSE_TEMPLATE = """Dado el historial de conversación y la nueva pregunta del usuario,
+reformula la pregunta para que sea autónoma y mantenga TODOS los nombres propios,
+términos de Pokémon, objetos y lugares exactamente como aparecen.
+Si la pregunta ya es autónoma, devuélvela SIN cambios.
+
+Historial:
+{chat_history}
+
+Pregunta original: {question}
+
+Pregunta reformulada (conserva todos los términos clave):"""
 
 # ---------------------------------------------------------------------------
 # Configuración de página
@@ -55,7 +69,6 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 # ---------------------------------------------------------------------------
 
 def extract_text_from_pdf(path: str) -> str:
-    """Extrae texto de todas las páginas del PDF, anotando el número de página."""
     try:
         reader = PdfReader(path)
         pages = []
@@ -70,12 +83,11 @@ def extract_text_from_pdf(path: str) -> str:
 
 
 def split_text(text: str) -> List[str]:
-    """Chunks más pequeños = recuperación más precisa."""
     if not text.strip():
         return []
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=150,
+        chunk_size=500,      # Chunks pequeños = recuperación más quirúrgica
+        chunk_overlap=100,
         length_function=len,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
@@ -89,7 +101,6 @@ def load_embeddings() -> HuggingFaceEmbeddings:
 
 @st.cache_resource(show_spinner="📖 El Profesor Z está memorizando la guía...")
 def build_knowledge_base(file_path: str) -> Optional[tuple]:
-    """Procesa el PDF y devuelve (vectorstore, chunks, raw_text)."""
     if not os.path.exists(file_path):
         return None
     text = extract_text_from_pdf(file_path)
@@ -102,17 +113,21 @@ def build_knowledge_base(file_path: str) -> Optional[tuple]:
 
 
 def build_chain(vectorstore: VectorStore, chunks: List[str], api_key: str) -> ConversationalRetrievalChain:
-    """Cadena RAG con retriever híbrido: semántico (FAISS) + por palabras clave (BM25)."""
     llm = ChatGoogleGenerativeAI(
         model=MODEL_NAME,
         google_api_key=api_key,
-        temperature=0.05,
+        temperature=0.0,   # Máxima fidelidad al contexto
         convert_system_message_to_human=True,
     )
 
-    prompt = PromptTemplate(
+    qa_prompt = PromptTemplate(
         input_variables=["context", "chat_history", "question"],
-        template=SYSTEM_TEMPLATE,
+        template=QA_TEMPLATE,
+    )
+
+    condense_prompt = PromptTemplate(
+        input_variables=["chat_history", "question"],
+        template=CONDENSE_TEMPLATE,
     )
 
     memory = ConversationBufferMemory(
@@ -121,17 +136,17 @@ def build_chain(vectorstore: VectorStore, chunks: List[str], api_key: str) -> Co
         output_key="answer",
     )
 
-    # FAISS: búsqueda semántica pura (sin MMR para no filtrar resultados relevantes)
+    # Semántico: alta k, sin MMR para no descartar chunks relevantes
     semantic_retriever = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 20},
+        search_kwargs={"k": 25},
     )
 
-    # BM25: búsqueda exacta por palabras clave (ideal para nombres de Pokémon, objetos, etc.)
+    # BM25: captura coincidencias exactas de nombres propios y términos del juego
     bm25_retriever = BM25Retriever.from_texts(chunks)
-    bm25_retriever.k = 20
+    bm25_retriever.k = 25
 
-    # Retriever híbrido: combina ambos con peso 50/50
+    # Híbrido 50/50
     hybrid_retriever = EnsembleRetriever(
         retrievers=[semantic_retriever, bm25_retriever],
         weights=[0.5, 0.5],
@@ -142,8 +157,30 @@ def build_chain(vectorstore: VectorStore, chunks: List[str], api_key: str) -> Co
         retriever=hybrid_retriever,
         memory=memory,
         return_source_documents=True,
-        combine_docs_chain_kwargs={"prompt": prompt},
+        combine_docs_chain_kwargs={"prompt": qa_prompt},
+        condense_question_prompt=condense_prompt,   # Reformulación conservadora
+        verbose=False,
     )
+
+
+def direct_search(query: str, vectorstore: VectorStore, chunks: List[str], k: int = 10) -> List[str]:
+    """Búsqueda directa sin LLM – para diagnosticar qué recupera el retriever."""
+    sem_docs = vectorstore.similarity_search(query, k=k)
+    sem_results = [d.page_content for d in sem_docs]
+
+    bm25 = BM25Retriever.from_texts(chunks)
+    bm25.k = k
+    bm25_docs = bm25.get_relevant_documents(query)
+    bm25_results = [d.page_content for d in bm25_docs]
+
+    # Unión sin duplicados, preservando orden
+    seen = set()
+    combined = []
+    for r in sem_results + bm25_results:
+        if r not in seen:
+            seen.add(r)
+            combined.append(r)
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +200,8 @@ def init_session():
             }
         ],
         "conversation": None,
+        "vectorstore": None,
+        "chunks": [],
         "api_key": "",
         "total_queries": 0,
         "chunk_count": 0,
@@ -186,7 +225,6 @@ def render_sidebar():
         )
         st.header("⚙️ Configuración")
 
-        # API Key: secrets > env var > input manual
         api_key = (
             st.secrets.get("GOOGLE_API_KEY", None)
             or os.environ.get("GOOGLE_API_KEY", None)
@@ -207,7 +245,7 @@ def render_sidebar():
 
         st.divider()
 
-        # Estado y diagnóstico del PDF
+        # Diagnóstico del PDF
         if os.path.exists(LOCAL_PDF_PATH):
             size_mb = os.path.getsize(LOCAL_PDF_PATH) / 1_048_576
             st.info(f"📚 **{LOCAL_PDF_PATH}** · {size_mb:.1f} MB")
@@ -218,22 +256,37 @@ def render_sidebar():
             st.success(f"🧩 **{st.session_state.chunk_count}** fragmentos indexados")
             st.caption(f"📝 {st.session_state.raw_text_len:,} caracteres extraídos")
             if st.session_state.chunk_count < 50:
-                st.warning(
-                    "⚠️ Muy pocos fragmentos. El PDF puede estar escaneado "
-                    "(imágenes en vez de texto). En ese caso se necesita OCR."
-                )
+                st.warning("⚠️ Muy pocos fragmentos — posible PDF escaneado.")
 
         st.divider()
 
-        # Toggle de modo debug — clave para diagnosticar problemas
+        # Modo debug
         st.session_state.debug_mode = st.toggle(
             "🔍 Modo Debug",
             value=st.session_state.debug_mode,
-            help=(
-                "Muestra los fragmentos exactos que el sistema recuperó. "
-                "Actívalo para ver si la info está en el contexto o no llega al modelo."
-            ),
+            help="Muestra los fragmentos exactos que el retriever envió al modelo.",
         )
+
+        # ── Herramienta de búsqueda directa ──────────────────────────────────
+        # Permite probar el retriever SIN el LLM para aislar el problema
+        if st.session_state.vectorstore is not None:
+            st.divider()
+            st.markdown("#### 🧪 Búsqueda directa en la guía")
+            st.caption("Prueba el retriever sin el modelo. Si aparece la info aquí pero el chat no la usa, el problema es el prompt de condensación.")
+            search_query = st.text_input("Buscar en la guía:", placeholder="Sylveon evolución")
+            if search_query:
+                results = direct_search(
+                    search_query,
+                    st.session_state.vectorstore,
+                    st.session_state.chunks,
+                    k=8,
+                )
+                if results:
+                    for i, r in enumerate(results[:6], 1):
+                        with st.expander(f"Resultado {i}"):
+                            st.code(r, language=None)
+                else:
+                    st.warning("Sin resultados.")
 
         st.divider()
 
@@ -262,7 +315,7 @@ def render_sidebar():
 
 def render_chat():
     st.title(f"{PAGE_ICON} Asistente Pokémon Z")
-    st.caption("Powered by Google Gemini · Retriever híbrido semántico + palabras clave")
+    st.caption("Powered by Google Gemini · Retriever híbrido semántico + BM25")
 
     # Inicializar RAG
     if st.session_state.api_key and st.session_state.conversation is None:
@@ -271,6 +324,8 @@ def render_chat():
                 kb = build_knowledge_base(LOCAL_PDF_PATH)
                 if kb:
                     vectorstore, chunks, raw_text = kb
+                    st.session_state.vectorstore = vectorstore
+                    st.session_state.chunks = chunks
                     st.session_state.chunk_count = len(chunks)
                     st.session_state.raw_text_len = len(raw_text)
                     st.session_state.conversation = build_chain(
@@ -278,16 +333,16 @@ def render_chat():
                     )
                     st.rerun()
                 else:
-                    st.error("No se pudo procesar la guía. Revisa el archivo PDF.")
+                    st.error("No se pudo procesar la guía.")
         else:
             st.warning("⚠️ El archivo `GuiaPokemonZ.pdf` no se encontró.")
 
-    # Historial de mensajes
+    # Historial
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if st.session_state.debug_mode and msg.get("sources"):
-                with st.expander("🔍 Fragmentos recuperados"):
+                with st.expander("🔍 Fragmentos enviados al modelo"):
                     for i, src in enumerate(msg["sources"], 1):
                         st.markdown(f"**Fragmento {i}:**")
                         st.code(src, language=None)
@@ -316,7 +371,7 @@ def render_chat():
                 st.caption(f"⏱️ {elapsed:.1f}s · {len(sources)} fragmentos consultados")
 
                 if st.session_state.debug_mode and sources:
-                    with st.expander("🔍 Fragmentos recuperados"):
+                    with st.expander("🔍 Fragmentos enviados al modelo"):
                         for i, src in enumerate(sources, 1):
                             st.markdown(f"**Fragmento {i}:**")
                             st.code(src, language=None)
