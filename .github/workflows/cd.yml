@@ -1,0 +1,73 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "terraform/**"
+      - ".github/workflows/cd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # Necesario para Workload Identity Federation
+
+env:
+  REGION: us-central1
+  AR_REPO: pokez-images
+  IMAGE_NAME: pokez-api
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: GCP auth (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_CI_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Docker auth
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Image tag
+        id: tag
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          echo "image=${REGION}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${AR_REPO}/${IMAGE_NAME}:${SHA}" >> $GITHUB_OUTPUT
+          echo "image_latest=${REGION}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${AR_REPO}/${IMAGE_NAME}:latest" >> $GITHUB_OUTPUT
+
+      - name: Build & push
+        run: |
+          docker build -f backend/Dockerfile -t ${{ steps.tag.outputs.image }} -t ${{ steps.tag.outputs.image_latest }} .
+          docker push ${{ steps.tag.outputs.image }}
+          docker push ${{ steps.tag.outputs.image_latest }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+
+      - name: Terraform init
+        working-directory: terraform/envs/dev
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        working-directory: terraform/envs/dev
+        env:
+          TF_VAR_project_id:        ${{ secrets.GCP_PROJECT_ID }}
+          TF_VAR_region:            ${{ env.REGION }}
+          TF_VAR_github_repository: ${{ github.repository }}
+          TF_VAR_container_image:   ${{ steps.tag.outputs.image }}
+          TF_VAR_google_api_key:    ${{ secrets.GOOGLE_API_KEY }}
+        run: terraform apply -auto-approve -input=false
+
+      - name: Output URL
+        working-directory: terraform/envs/dev
+        run: terraform output -raw service_url

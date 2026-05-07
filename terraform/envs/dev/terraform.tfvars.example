@@ -1,0 +1,5 @@
+project_id        = "tu-proyecto-gcp"
+region            = "us-central1"
+github_repository = "tu-usuario/PokemonZ"
+container_image   = "us-docker.pkg.dev/cloudrun/container/hello"  # placeholder para 1er apply
+google_api_key    = "AIza..."
